@@ -4308,6 +4308,12 @@ function registerIpc() {
     assertMainRenderer(event);
     return autoUpdater.handleUserChoice(String(choice || ''));
   });
+  // 渲染层启动时主动来拉一次：更新检查是并发的，可能比监听注册更早，
+  // 那条 app:update-available 就丢了（IPC 没有接收者）。这里把待办取回去补弹。
+  ipcMain.handle('app:update-pending', (event) => {
+    assertMainRenderer(event);
+    return autoUpdater.getPendingUpdate();
+  });
   ipcMain.handle('system:splash-state', (event) => { assertMainRenderer(event); return splashState(); });
   ipcMain.handle('system:hardware', () => getHardwareProfile());
   ipcMain.handle('system:open-url', (_event, rawUrl) => {

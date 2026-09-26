@@ -124,6 +124,33 @@ test('main.cjs 注入存储与渲染桥，自检/冒烟模式不联网', () => {
   assert.match(source, /if \(skipAutoCheck\) return;/, 'disableAutoUpdater 要真的生效');
 });
 
+test('按 Esc 关掉卡片也算「取消」，且不重复上报', () => {
+  assert.match(appSrc, /let updateChoiceSent = false;/);
+  assert.match(appSrc, /\$\('#updateDialog'\)\?\.addEventListener\('close'/,
+    'dialog 的 close 事件（Esc）要当成取消');
+  assert.match(appSrc, /if \(updateChoiceSent\) return;/, 'close 回调里要防重复上报');
+  assert.match(appSrc, /updateChoiceSent = false;\s*\n\s*if \(!dialog\.open\) dialog\.showModal\(\);/,
+    '每次弹卡片都要重置标记');
+  // 三个按钮都必须先把标记置上，免得 close 回调再补发一次
+  for (const choice of ['cancel', 'skip', 'update']) {
+    const at = appSrc.indexOf(`window.ph.updateChoice?.('${choice}')`);
+    assert.ok(at > 0, `缺 ${choice} 的回传`);
+    assert.ok(appSrc.lastIndexOf('updateChoiceSent = true;', at) > 0,
+      `${choice} 按钮要先置 updateChoiceSent`);
+  }
+});
+
+test('渲染层启动时主动拉一次待办更新（IPC 早到也不会丢）', () => {
+  // 检查跟渲染层初始化是并发的：先发现新版本的话，app:update-available
+  // 发出去时还没人监听，消息就没了 —— 所以渲染层要能反过来取一次。
+  assert.match(source, /function getPendingUpdate\(\)/);
+  assert.match(source, /if \(phase !== 'waiting-user' \|\| !pendingUpdate\?\.version\) return null;/);
+  assert.match(source, /getPendingUpdate,/, '要导出给 main.cjs 用');
+  assert.match(mainSrc, /ipcMain\.handle\('app:update-pending'/);
+  assert.match(preloadSrc, /updatePending: \(\) => ipcRenderer\.invoke\('app:update-pending'\)/);
+  assert.match(appSrc, /window\.ph\.updatePending\?\.\(\)/);
+});
+
 test('发布配置与 macOS 构建产出 zip（自动替换的前提）', () => {
   assert.equal(pkg.build.publish.provider, 'generic');
   assert.equal(pkg.build.publish.url, 'https://phix.ing/updates/phl');

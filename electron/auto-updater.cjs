@@ -71,7 +71,11 @@ function progress(stage, extra = {}) {
   }
 }
 
-/** 把"发现新版本"告诉渲染层（由它弹卡片）。 */
+/**
+ * 把"发现新版本"告诉渲染层（由它弹卡片）。
+ * 同时记进 pendingUpdate —— 渲染层要是还没注册好监听（IPC 消息会丢），
+ * 它启动后可以调 getPendingUpdate() 把这条取走。
+ */
 function askUser(version, notes) {
   phase = 'waiting-user';
   pendingUpdate = { ...(pendingUpdate || {}), version, notes };
@@ -90,6 +94,27 @@ function shortNotes(text, limit = 400) {
   const t = String(text || '').trim();
   if (!t) return '';
   return t.length > limit ? `${t.slice(0, limit)}…` : t;
+}
+
+/**
+ * 还没被用户处理的那条更新（渲染层启动时主动来拉一次）。
+ *
+ * 为什么要"拉"：更新检查是并发的，很可能在渲染层注册好
+ * `app:update-available` 监听之前就把消息发过去了 —— IPC 发出去没人接就没了，
+ * 卡片永远不弹。渲染层启动时调这个把待办取走，就不用赌时序。
+ * 用户已经选过（cancel 会保持 waiting-user，skip/update 会离开）时按状态返回。
+ */
+function getPendingUpdate() {
+  if (phase !== 'waiting-user' || !pendingUpdate?.version) return null;
+  try {
+    return {
+      version: pendingUpdate.version,
+      current: app.getVersion(),
+      notes: pendingUpdate.notes || '',
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ---------------- 检查 ----------------
@@ -421,5 +446,6 @@ module.exports = {
   initAutoUpdater,
   disableAutoUpdater,
   handleUserChoice,
+  getPendingUpdate,
   getStatus: () => phase,
 };

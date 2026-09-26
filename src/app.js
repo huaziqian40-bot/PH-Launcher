@@ -251,6 +251,9 @@ function relativeTime(value) {
  * 主进程只负责**检查与通知**；下不下载、装不装，永远由用户在这张卡片上决定。
  * 「跳过本版本」记住的是版本号本身：之后更高的版本还会再提示。
  */
+//: 用户已经在卡片上做过选择（含按 Esc 关掉）——避免重复把选择回传主进程
+let updateChoiceSent = false;
+
 function showUpdateCard(info) {
   const dialog = $('#updateDialog');
   if (!dialog) return;
@@ -261,9 +264,10 @@ function showUpdateCard(info) {
     : `新版本 v${latest}`;
   const notes = String(info?.notes || '').trim();
   $('#updateNotes').textContent = notes || '本次更新以稳定性与体验改进为主。';
-  $('#updateHint').textContent = '更新会下载新版本并在你确认后安装，不会丢失任何数据。';
+  $('#updateHint').textContent = '点「更新」之后才会开始下载并安装；不点就继续用现在这版，数据不会丢。';
   $('#updateNow').disabled = false;
   $('#updateSkip').disabled = false;
+  updateChoiceSent = false;
   if (!dialog.open) dialog.showModal();
 }
 
@@ -3466,16 +3470,25 @@ function bindEvents() {
   $('#aiConfigPanel').addEventListener('click', handleAiConfigPanelClick);
 
   // 更新卡片的三个按钮：取消（这次先不选）/ 跳过本版本 / 更新
+  // 按 Esc 关掉卡片也算「取消」—— 也要上报一次，但别和按钮重复上报。
+  $('#updateDialog')?.addEventListener('close', () => {
+    if (updateChoiceSent) return;
+    updateChoiceSent = true;
+    window.ph.updateChoice?.('cancel');
+  });
   $('#updateCancel')?.addEventListener('click', async () => {
+    updateChoiceSent = true;
     $('#updateDialog')?.close();
     await window.ph.updateChoice?.('cancel');
   });
   $('#updateSkip')?.addEventListener('click', async () => {
+    updateChoiceSent = true;
     $('#updateDialog')?.close();
     await window.ph.updateChoice?.('skip');
     toast('已跳过这个版本；更高的新版本仍会提示', 'normal');
   });
   $('#updateNow')?.addEventListener('click', async () => {
+    updateChoiceSent = true;
     $('#updateNow').disabled = true;
     $('#updateSkip').disabled = true;
     await window.ph.updateChoice?.('update');
@@ -3667,6 +3680,11 @@ async function init() {
     // 发现新版本：弹卡片让用户决定（取消 / 跳过本版本 / 更新）—— 绝不自动更新。
     window.ph.onUpdateAvailable?.((info) => showUpdateCard(info));
     window.ph.onUpdateProgress?.((progress) => handleUpdateProgress(progress));
+    // 检查是并发的，可能在上面的监听注册之前就发现新版本了（那条 IPC 没人接就没了）。
+    // 启动时主动拉一次待办，补弹卡片。
+    void window.ph.updatePending?.()
+      .then((pending) => { if (pending && pending.version) showUpdateCard(pending); })
+      .catch(() => { /* 拿不到就算了：下次启动还会提示 */ });
     if (state.data.settings.onboardingCompleted !== true) {
       // 先尝试恢复 phix 会话（盘上有令牌就跳过 phix 引导）
       const restored = await tryPhixRestore();
