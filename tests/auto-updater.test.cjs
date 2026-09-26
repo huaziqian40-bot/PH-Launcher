@@ -1,12 +1,11 @@
 'use strict';
 
 /**
- * 应用内自动更新（PHL）接线测试。
+ * 应用内更新（PHL）接线测试。
  *
- * Windows：electron-updater 全自动（下载→静默安装→重启）。
- * macOS（未签名）：自研"下载 zip → 校验 → 解压 → 替换 .app → 清 quarantine →
- *   ad-hoc 重签 → 重启"，用户只需在新版首次启动时右键打开一次；
- *   准备失败才降级到打开的下载页。
+ * 核心不变式：**只检查、只提示，绝不自动更新**。
+ * 进入软件后检查一次；发现新版本弹卡片（版本号 + 更新内容 + 取消/跳过本版本/更新）；
+ * 只有用户点「更新」才会下载并安装。
  */
 
 const test = require('node:test');
@@ -15,62 +14,120 @@ const fs = require('node:fs');
 
 const source = fs.readFileSync(require.resolve('../electron/auto-updater.cjs'), 'utf8');
 const mainSrc = fs.readFileSync(require.resolve('../electron/main.cjs'), 'utf8');
+const preloadSrc = fs.readFileSync(require.resolve('../electron/preload.cjs'), 'utf8');
+const appSrc = fs.readFileSync(require.resolve('../src/app.js'), 'utf8');
+const htmlSrc = fs.readFileSync(require.resolve('../src/index.html'), 'utf8');
 const pkg = JSON.parse(fs.readFileSync(require.resolve('../package.json'), 'utf8'));
 
-test('Windows 走 electron-updater 全自动（下载→静默安装→重启）', () => {
-  assert.match(source, /const \{ autoUpdater \} = require\('electron-updater'\)/);
-  assert.match(source, /autoUpdater\.autoDownload = true/);
-  assert.match(source, /autoUpdater\.autoInstallOnAppQuit = true/);
-  assert.match(source, /quitAndInstall\(\{ isSilent: true, isForceRunAfter: true \}\)/,
-    '退出时静默安装并自动重启');
+test('Windows：关掉 electron-updater 的自动下载与自动安装', () => {
+  assert.match(source, /autoUpdater\.autoDownload = false/,
+    '必须关掉自动下载 —— 用户没点更新前不该下任何东西');
+  assert.match(source, /autoUpdater\.autoInstallOnAppQuit = false/,
+    '必须关掉退出时自动安装');
+  assert.doesNotMatch(source, /autoUpdater\.autoDownload = true/);
+  assert.doesNotMatch(source, /autoUpdater\.autoInstallOnAppQuit = true/);
 });
 
-test('macOS 自动下载 zip 并校验 SHA256（不是只提示用户去下载）', () => {
-  assert.match(source, /https:\/\/phix\.ing\/api\/v1\/update\/check\?product=phl&platform=mac/);
-  assert.match(source, /url\.endsWith\('\.zip'\)/, '只接受 zip 载荷（dmg 无法自动替换）');
+test('只有用户在卡片上点「更新」才会下载/安装', () => {
+  assert.match(source, /async function handleUserChoice\(choice\)/);
+  const fn = source.slice(source.indexOf('async function handleUserChoice'));
+  const body = fn.slice(0, fn.indexOf('\n// ---------------- macOS'));
+  assert.match(body, /autoUpdater\.downloadUpdate\(\)/, '点更新后才下载');
+
+  // downloadUpdate 全局只应出现一次，且必须在 handleUserChoice 里
+  // （检查阶段只注册事件，绝不主动下载）
+  const calls = [...source.matchAll(/autoUpdater\.downloadUpdate\(\)/g)].length;
+  assert.equal(calls, 1, `downloadUpdate 只该在用户点更新时调用一次，实际 ${calls} 处`);
+  const at = source.indexOf('autoUpdater.downloadUpdate()');
+  assert.ok(at > source.indexOf('async function handleUserChoice'), '必须在 handleUserChoice 内');
+  assert.ok(at < source.indexOf('async function stageMacUpdate'), '且不能在 macOS 分支之后');
+
+  // 安装只能在下载完成的回调里（不是检查时）。
+  // 注意从 update-downloaded 之后再找 —— 文件头部注释里也提到过 quitAndInstall。
+  const dlIdx = source.indexOf("autoUpdater.on('update-downloaded'");
+  assert.ok(dlIdx > 0, '要有 update-downloaded 处理');
+  const qI = source.indexOf('quitAndInstall', dlIdx);
+  assert.ok(qI > dlIdx, 'quitAndInstall 必须在 update-downloaded 回调内');
+
+  // 检查函数里不能主动下载/安装
+  const checkWin = source.slice(source.indexOf('async function checkWindows'),
+                                source.indexOf('async function checkMac'));
+  const checkWinNoHandlers = checkWin.replace(/autoUpdater\.on\([\s\S]*?\n  \}\);/g, '');
+  assert.doesNotMatch(checkWinNoHandlers, /autoUpdater\.downloadUpdate\(\)/, '检查阶段绝不下载');
+  assert.doesNotMatch(checkWinNoHandlers, /qtAndInstall/, '检查阶段绝不安装');
+});
+
+test('三个选择：cancel 什么都不做 / skip 记住版本 / update 才执行', () => {
+  assert.match(source, /if \(choice === 'cancel'\) return \{ ok: true, action: 'cancel' \};/);
+  assert.match(source, /if \(choice === 'skip'\) \{[\s\S]{0,200}?hooks\.setSkippedVersion\(version\)/);
+  assert.match(source, /if \(choice !== 'update'\) return \{ ok: false, action: 'unknown' \};/);
+});
+
+test('「跳过本版本」只拦相同版本（更高的版本仍会提示）', () => {
+  assert.match(source, /if \(String\(hooks\.getSkippedVersion\(\) \|\| ''\) === String\(info\.version\)\)/);
+  assert.match(source, /if \(String\(hooks\.getSkippedVersion\(\) \|\| ''\) === latest\)/);
+  // 存储字段
+  assert.match(mainSrc, /skippedUpdateVersion: ''/, 'settings 里要有这个字段');
+  assert.match(mainSrc, /secureStore\.data\.settings\.skippedUpdateVersion = String\(version \|\| ''\)/);
+});
+
+test('检查到新版本 → 通知渲染层弹卡片（不是自己下载）', () => {
+  assert.match(source, /hooks\.sendToRenderer\('app:update-available'/);
+  assert.match(source, /function askUser\(version, notes\)/);
+  assert.match(preloadSrc, /onUpdateAvailable: \(callback\) => on\('app:update-available', callback\)/);
+  assert.match(preloadSrc, /updateChoice: \(choice\) => ipcRenderer\.invoke\('app:update-choice', choice\)/);
+  assert.match(preloadSrc, /onUpdateProgress: \(callback\) => on\('app:update-progress', callback\)/);
+});
+
+test('卡片里有版本号、更新内容和三个按钮', () => {
+  assert.match(htmlSrc, /id="updateDialog"/);
+  assert.match(htmlSrc, /id="updateVersion"/);
+  assert.match(htmlSrc, /id="updateNotes"/);
+  assert.match(htmlSrc, /id="updateCancel"/);
+  assert.match(htmlSrc, /id="updateSkip"/);
+  assert.match(htmlSrc, /id="updateNow"/);
+  assert.match(appSrc, /function showUpdateCard\(info\)/);
+  assert.match(appSrc, /新版本 v\$\{latest\}（当前 v\$\{current\}）/, '卡片要显示版本号');
+  assert.match(appSrc, /window\.ph\.updateChoice\?\.\('cancel'\)/);
+  assert.match(appSrc, /window\.ph\.updateChoice\?\.\('skip'\)/);
+  assert.match(appSrc, /window\.ph\.updateChoice\?\.\('update'\)/);
+});
+
+test('macOS：用户确认后才下载 zip → 校验 → 解压 → 替换 → 清 quarantine → 重签 → 重启', () => {
+  assert.match(source, /MAC_CHECK_URL/);
+  assert.match(source, /url\.endsWith\('\.zip'\)/, '只接受 zip 载荷');
   assert.match(source, /sha256File\(zipPath\) !== sha/, 'SHA256 不匹配要丢弃');
-  assert.match(source, /downloadFile\(url, zipPath\)/, '自己下载');
-});
-
-test('macOS 解压与替换：ditto 解包、旧包进废纸篓、清 quarantine、ad-hoc 重签、重启', () => {
-  assert.match(source, /execFileSync\('\/usr\/bin\/ditto', \['-x', '-k', zipPath, staging\]\)/,
-    '用 ditto 解 zip（保留权限与符号链接）');
-  assert.match(source, /function writeAndLaunchSwapScript/, '要有替换脚本');
+  assert.match(source, /execFileSync\('\/usr\/bin\/ditto', \['-x', '-k', zipPath, staging\]\)/);
+  assert.match(source, /function writeAndLaunchSwapScript/);
   assert.match(source, /kill -0 "\$PID"/, '脚本要等主进程退出');
-  assert.match(source, /\.Trash/, '旧包移进废纸篓而不是直接删（可捞回）');
-  assert.match(source, /xattr -dr com\.apple\.quarantine/, '清隔离属性，避免"应用已损坏"');
-  assert.match(source, /codesign --sign - --deep --force/, 'ad-hoc 重签');
-  assert.match(source, /\/usr\/bin\/open "\$TARGET"/, '重启新版');
-  assert.match(source, /spawn\('\/bin\/bash', \[script\], \{ detached: true/, '脚本要脱离主进程');
+  assert.match(source, /\.Trash/, '旧包进废纸篓（可捞回）');
+  assert.match(source, /xattr -dr com\.apple\.quarantine/);
+  assert.match(source, /codesign --sign - --deep --force/);
+  assert.match(source, /spawn\('\/bin\/bash', \[script\], \{ detached: true/);
+  // 替换只能由 handleUserChoice('update') 触发
+  assert.match(source, /const ok = await stageMacUpdate\(pendingUpdate\.macEntry, pendingUpdate\.version\)/);
 });
 
-test('macOS 定位当前 .app，不在 .app 内运行（开发模式）时不自动替换', () => {
-  assert.match(source, /function currentAppBundle\(\)/, '要从可执行文件上溯找 .app');
-  assert.match(source, /if \(!appPath\) return false; \/\/ 不在 \.app 里运行（开发模式）→ 不自动替换/);
-  assert.match(source, /function findAppBundle\(dir\)/, 'staging 里要能找出 .app（可能包一层目录）');
+test('开发模式（不在 .app 内）不替换，准备失败才降级到下载页', () => {
+  assert.match(source, /function currentAppBundle\(\)/);
+  assert.match(source, /if \(!appPath\) return false; \/\/ 开发模式（不在 \.app 内）不自动替换/);
+  assert.match(source, /function findAppBundle\(dir\)/);
+  assert.match(source, /await shell\.openExternal\(DOWNLOAD_URL\)/, '只有准备失败才打开下载页');
 });
 
-test('macOS 自动替换失败时才降级到下载页', () => {
-  assert.match(source, /async function fallbackOpenDownloadPage/);
-  assert.match(source, /const ok = await downloadAndStageMac\(data, latest\);/);
-  assert.match(source, /await fallbackOpenDownloadPage\(latest\);/, '准备失败才降级');
-  assert.match(source, /shell\.openExternal\(DOWNLOAD_URL\)/);
+test('main.cjs 注入存储与渲染桥，自检/冒烟模式不联网', () => {
+  assert.match(mainSrc, /autoUpdater\.initAutoUpdater\(\{/);
+  assert.match(mainSrc, /getSkippedVersion: \(\) => String\(secureStore\?\.data\?\.settings\?\.skippedUpdateVersion/);
+  assert.match(mainSrc, /sendToRenderer: \(channel, payload\) => sendToRenderer\(channel, payload\)/);
+  assert.match(mainSrc, /ipcMain\.handle\('app:update-choice'/);
+  assert.match(mainSrc, /if \(IS_HEADLESS\) \{\s*\n\s*autoUpdater\.disableAutoUpdater\(\);/);
+  assert.match(source, /if \(skipAutoCheck\) return;/, 'disableAutoUpdater 要真的生效');
 });
 
-test('发布配置指向 phix 的 generic 服务器，Windows 用 latest.yml', () => {
+test('发布配置与 macOS 构建产出 zip（自动替换的前提）', () => {
   assert.equal(pkg.build.publish.provider, 'generic');
   assert.equal(pkg.build.publish.url, 'https://phix.ing/updates/phl');
-});
-
-test('main.cjs 在窗口创建后启动自动更新，且自检/冒烟模式禁用', () => {
-  assert.match(mainSrc, /autoUpdater\.initAutoUpdater\(\)/);
-  assert.match(mainSrc, /if \(IS_HEADLESS\) \{\s*\n\s*autoUpdater\.disableAutoUpdater\(\);/,
-    '自检/冒烟/截图模式不联网检查');
-});
-
-test('macOS 构建产出 zip 载荷（自动替换的前提）', () => {
   const buildScript = fs.readFileSync(require.resolve('../scripts/macos_build_phl.py'), 'utf8');
-  assert.match(buildScript, /electron-builder --mac dmg zip/, '要带 zip target');
-  assert.match(buildScript, /zips = \[l\.split\(\)\[-1\]/, '要收集 zip');
-  assert.match(buildScript, /for name in dmgs \+ zips:/, 'zip 也要拉回本地');
+  assert.match(buildScript, /electron-builder --mac dmg zip/);
+  assert.match(buildScript, /for name in dmgs \+ zips:/);
 });

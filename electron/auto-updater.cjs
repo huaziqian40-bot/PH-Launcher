@@ -1,24 +1,23 @@
 'use strict';
 /**
- * 应用内自动更新（PHL）。
+ * 应用内更新（PHL）—— **只检查、只提示，绝不自动更新**。
  *
- * Windows（NSIS 安装版）：
- *   用 electron-updater 全自动：启动时静默检查 → 下载（后台）→ 退出时静默安装 → 重启。
- *   安装目录的用户数据（%APPDATA%）不受影响。
+ * 统一交互（与心履 Android 端一致）：进入软件后检查一次；发现新版本就弹卡片，
+ * 卡片上写版本号 + 本次更新内容 + 三个按钮：
+ *   · 取消        这次先不选，继续用软件（下次启动还会提示）
+ *   · 跳过本版本  记住这个版本号，之后不再提示（**更高的版本仍会提示**）
+ *   · 更新        这时才下载并安装
  *
- * macOS（未签名）：
- *   electron-updater 的 ShipIt 会因未签名拒绝安装，所以自己实现"下载 → 替换"：
- *     1. 调 /api/v1/update/check 拿新版本的 **.zip**（内含 .app）与 sha256
- *     2. 下载 → SHA256 校验 → 解压到 userData/.update-staging/
- *     3. 写一个脱离主进程的 bash 脚本：等本进程退出 → 旧 .app 移进废纸篓 →
- *        新 .app 复制到原位 → xattr 清 quarantine → codesign ad-hoc 重签 → open 重启
- *   **用户只需要在新版本首次启动时右键 →「打开」一次**（未签名应用的 Gatekeeper 限制），
- *   不需要自己下载。若自动替换失败（App Translocation、权限等），降级为：
- *   把新版放到「下载」目录并用 Finder 显示，提示用户拖拽替换。
+ * Windows：用 electron-updater，但把它的自动下载与自动安装都关掉
+ *   （autoDownload=false、autoInstallOnAppQuit=false），改为用户确认后
+ *   才 downloadUpdate() → quitAndInstall()。
+ * macOS（未签名）：自研流程 —— 用户确认后下载 zip → SHA256 校验 → ditto 解压 →
+ *   退出后替换 .app → 清 com.apple.quarantine → codesign ad-hoc 重签 → open 重启。
+ *   用户只需在新版本首次打开时右键 →「打开」一次。
  *
- * 更新源（清单由 phix-server 提供，安装包由官网托管）：
- *   Windows: https://phix.ing/updates/phl/latest.yml  （electron-builder 生成）
- *   macOS:   https://phix.ing/api/v1/update/check?product=phl&platform=mac
+ * 更新源：清单由 phix-server 提供，载荷由官网托管。
+ *   Windows: https://phix.ing/updates/phl/latest.yml（electron-updater 用）
+ *   两端版本说明: https://phix.ing/api/v1/update/check?product=phl&platform=…
  */
 
 const { app, shell, Notification } = require('electron');
@@ -29,137 +28,223 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn, execFileSync } = require('node:child_process');
 
-const CHECK_URL = 'https://phix.ing/api/v1/update/check?product=phl&platform=mac';
+const MAC_CHECK_URL = 'https://phix.ing/api/v1/update/check?product=phl&platform=mac';
+const WIN_CHECK_URL = 'https://phix.ing/api/v1/update/check?product=phl&platform=win';
 const DOWNLOAD_URL = 'https://phix.ing/download/';
-const USER_AGENT = () => `PH-Launcher-${app.getVersion()}`;
 
-let updaterStatus = ''; // '', 'checking', 'available', 'downloading', 'ready', 'not-available', 'error'
+/** 由 main.cjs 注入：读/写"跳过本版本"、给渲染层发消息、取窗口 */
+let hooks = {
+  getSkippedVersion: () => '',
+  setSkippedVersion: () => {},
+  sendToRenderer: () => {},
+  getMainWindow: () => null,
+};
+
 let skipAutoCheck = false;
+/** 当前待用户决定的新版本：{ version, notes, macEntry } */
+let pendingUpdate = null;
+/** 'idle' | 'checking' | 'waiting-user' | 'downloading' | 'applying' | 'error' */
+let phase = 'idle';
 
-function statusChanged(status) {
-  updaterStatus = status;
+function userAgent() {
   try {
-    const win = require('./main.cjs').getMainWindow?.();
-    if (win && !win.isDestroyed()) {
-      win.webContents.send('app:update-status', status);
-    }
+    return `PH-Launcher-${app.getVersion()}`;
   } catch {
-    /* 尚未初始化窗口时忽略 */
+    return 'PH-Launcher';
   }
 }
 
 function notify(title, body) {
   try {
-    if (Notification.isSupported()) {
-      new Notification({ title, body, silent: true }).show();
-    }
+    if (Notification.isSupported()) new Notification({ title, body, silent: true }).show();
   } catch {
-    /* 通知失败不影响更新流程 */
+    /* 通知失败不影响流程 */
   }
 }
 
-// ---------------- Windows：electron-updater 全自动 ----------------
+function progress(stage, extra = {}) {
+  phase = stage;
+  try {
+    hooks.sendToRenderer('app:update-progress', { stage, ...extra });
+  } catch {
+    /* 渲染层可能还没准备好 */
+  }
+}
 
-function setupWindowsAutoUpdater() {
-  autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
+/** 把"发现新版本"告诉渲染层（由它弹卡片）。 */
+function askUser(version, notes) {
+  phase = 'waiting-user';
+  pendingUpdate = { ...(pendingUpdate || {}), version, notes };
+  try {
+    hooks.sendToRenderer('app:update-available', {
+      version,
+      current: app.getVersion(),
+      notes: notes || '',
+    });
+  } catch {
+    /* 窗口没准备好就等下次启动再提示 */
+  }
+}
 
-  autoUpdater.on('checking-for-update', () => statusChanged('checking'));
-  autoUpdater.on('update-available', () => statusChanged('available'));
-  autoUpdater.on('update-not-available', () => statusChanged('not-available'));
-  autoUpdater.on('download-progress', () => statusChanged('downloading'));
-  autoUpdater.on('update-downloaded', (info) => {
-    statusChanged('ready');
-    notify('PH Launcher 更新已就绪', `v${info.version} 将在退出时自动安装。`);
+function shortNotes(text, limit = 400) {
+  const t = String(text || '').trim();
+  if (!t) return '';
+  return t.length > limit ? `${t.slice(0, limit)}…` : t;
+}
+
+// ---------------- 检查 ----------------
+
+async function fetchCheck(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const resp = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': userAgent() } });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data && data.ok ? data : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkWindows() {
+  phase = 'checking';
+  // 关掉自动下载与自动安装：一切等用户在卡片上点「更新」。
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  autoUpdater.on('download-progress', (p) => {
+    progress('downloading', { percent: p?.percent || 0 });
+  });
+  autoUpdater.on('update-downloaded', () => {
+    progress('applying', { message: '更新已下载，正在安装并重启…' });
     try {
-      // 静默安装并在安装完成后启动新版本（不打断用户当前操作）
       autoUpdater.quitAndInstall({ isSilent: true, isForceRunAfter: true });
     } catch {
-      // 某些版本用旧式位置参数；两者都试
       autoUpdater.quitAndInstall(true, true);
     }
   });
   autoUpdater.on('error', (err) => {
-    statusChanged('error');
     console.error('[auto-updater]', err);
+    progress('error', { message: String(err?.message || err) });
   });
-}
 
-function checkWindowsUpdate() {
-  if (skipAutoCheck) return;
-  setupWindowsAutoUpdater();
-  autoUpdater.checkForUpdates().catch((err) => {
-    statusChanged('error');
-    console.error('[auto-updater] check failed', err);
-  });
-}
-
-// ---------------- macOS：半自动（未签名，提示打开下载页） ----------------
-
-async function checkMacUpdate() {
-  if (skipAutoCheck) return;
-  statusChanged('checking');
+  let info = null;
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 10000);
-    const resp = await fetch(CHECK_URL, { signal: ctrl.signal, headers: { 'User-Agent': USER_AGENT() } });
-    clearTimeout(timer);
-    if (!resp.ok) {
-      statusChanged('not-available');
-      return;
-    }
-    const data = await resp.json();
-    if (!data.ok) {
-      statusChanged('not-available');
-      return;
-    }
-    const current = app.getVersion();
-    const latest = String(data.latest_version || '');
-    if (!latest || latest === current) {
-      statusChanged('not-available');
-      return;
-    }
-    statusChanged('available');
-
-    // 下载 → 校验 → 解压 → 写替换脚本（用户只需在新版首次启动时右键打开一次）
-    const ok = await downloadAndStageMac(data, latest);
-    if (ok) {
-      statusChanged('ready');
-      notify('PH Launcher 更新已就绪',
-        `v${latest} 将在退出后自动替换安装；下次打开时请右键 →「打开」一次。`);
-    } else {
-      // 自动替换准备失败 → 降级：把新版放到下载目录并用 Finder 显示
-      await fallbackOpenDownloadPage(latest);
-    }
+    const result = await autoUpdater.checkForUpdates();
+    info = result?.updateInfo || null;
   } catch (err) {
-    console.error('[auto-updater] mac check failed', err);
-    statusChanged('not-available');
+    console.error('[auto-updater] check failed', err);
+    phase = 'idle';
+    return;
   }
+  if (!info?.version || info.version === app.getVersion()) {
+    phase = 'idle';
+    return;
+  }
+  // 用户点过「跳过本版本」→ 同版本不再提示
+  if (String(hooks.getSkippedVersion() || '') === String(info.version)) {
+    phase = 'idle';
+    return;
+  }
+  // 版本说明走接口（latest.yml 里没有 releaseNotes）
+  const data = await fetchCheck(WIN_CHECK_URL);
+  pendingUpdate = { version: info.version, macEntry: null };
+  askUser(info.version, shortNotes(data?.release_notes));
 }
 
-/** 下载 zip → SHA256 校验 → 解压到 staging → 写 bash 替换脚本并启动它。 */
-async function downloadAndStageMac(entry, latest) {
-  const url = entry.url;
-  const sha = String(entry.sha256 || '').toLowerCase();
-  if (!url || !sha || !url.endsWith('.zip')) return false;
+async function checkMac() {
+  phase = 'checking';
+  const data = await fetchCheck(MAC_CHECK_URL);
+  if (!data) {
+    phase = 'idle';
+    return;
+  }
+  const latest = String(data.latest_version || '');
+  if (!latest || latest === app.getVersion()) {
+    phase = 'idle';
+    return;
+  }
+  if (String(hooks.getSkippedVersion() || '') === latest) {
+    phase = 'idle';
+    return;
+  }
+  pendingUpdate = { version: latest, macEntry: data };
+  askUser(latest, shortNotes(data.release_notes));
+}
+
+// ---------------- 用户在卡片上的选择 ----------------
+
+/**
+ * 'cancel' → 什么都不做，继续用软件（下次启动还会提示）
+ * 'skip'   → 记住版本号，该版本不再提示（更高的版本仍会提示）
+ * 'update' → 这时才真正下载并安装
+ */
+async function handleUserChoice(choice) {
+  if (choice === 'cancel') return { ok: true, action: 'cancel' };
+  if (choice === 'skip') {
+    const version = pendingUpdate?.version || '';
+    if (version) hooks.setSkippedVersion(version);
+    pendingUpdate = null;
+    phase = 'idle';
+    return { ok: true, action: 'skip', version };
+  }
+  if (choice !== 'update') return { ok: false, action: 'unknown' };
+  if (!pendingUpdate) return { ok: false, action: 'nothing-pending' };
+
+  if (process.platform === 'win32') {
+    progress('downloading', { percent: 0 });
+    try {
+      await autoUpdater.downloadUpdate();
+      // 下载完成后由 update-downloaded 事件接管安装
+      return { ok: true, action: 'update' };
+    } catch (err) {
+      progress('error', { message: String(err?.message || err) });
+      return { ok: false, action: 'update', message: String(err?.message || err) };
+    }
+  }
+  if (process.platform === 'darwin') {
+    progress('downloading', { percent: 0 });
+    const ok = await stageMacUpdate(pendingUpdate.macEntry, pendingUpdate.version);
+    if (ok) {
+      progress('applying', { message: '正在替换应用，稍后会自动重启。' });
+      notify('PH Launcher 正在更新', `退出后将自动替换为 v${pendingUpdate.version}。`);
+      setTimeout(() => app.quit(), 1500);
+      return { ok: true, action: 'update' };
+    }
+    progress('error', { message: '自动替换没能准备好，已为你打开下载页。' });
+    try {
+      await shell.openExternal(DOWNLOAD_URL);
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, action: 'update', message: 'prepare-failed' };
+  }
+  return { ok: false, action: 'unsupported-platform' };
+}
+
+// ---------------- macOS：用户确认后才下载并替换 ----------------
+
+async function stageMacUpdate(entry, latest) {
+  const url = String(entry?.url || '');
+  const sha = String(entry?.sha256 || '').toLowerCase();
+  if (!url.endsWith('.zip') || !sha) return false;
+
+  const appPath = currentAppBundle();
+  if (!appPath) return false; // 开发模式（不在 .app 内）不自动替换
 
   const staging = path.join(app.getPath('userData'), '.update-staging');
   const zipPath = path.join(staging, 'update.zip');
-  const appPath = currentAppBundle();
-  if (!appPath) return false; // 不在 .app 里运行（开发模式）→ 不自动替换
-
   try {
     fs.rmSync(staging, { recursive: true, force: true });
     fs.mkdirSync(staging, { recursive: true });
-    statusChanged('downloading');
-    await downloadFile(url, zipPath);
-
-    // SHA256 校验：不匹配就丢弃（防篡改/半截包）
+    await downloadFile(url, zipPath, (percent) => progress('downloading', { percent }));
     if (sha256File(zipPath) !== sha) {
       fs.rmSync(staging, { recursive: true, force: true });
       return false;
     }
-    // 解压（macOS 自带 ditto；-x -k 解 zip，保留权限与符号链接）
     execFileSync('/usr/bin/ditto', ['-x', '-k', zipPath, staging]);
     fs.rmSync(zipPath, { force: true });
 
@@ -168,12 +253,15 @@ async function downloadAndStageMac(entry, latest) {
       fs.rmSync(staging, { recursive: true, force: true });
       return false;
     }
-
     writeAndLaunchSwapScript(appPath, newApp, staging, latest);
     return true;
   } catch (err) {
     console.error('[auto-updater] mac stage failed', err);
-    try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* ignore */ }
+    try {
+      fs.rmSync(staging, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
     return false;
   }
 }
@@ -181,22 +269,27 @@ async function downloadAndStageMac(entry, latest) {
 /** 当前 .app 路径（从可执行文件上溯 Contents/MacOS/xxx → .app）。 */
 function currentAppBundle() {
   try {
-    let p = path.dirname(app.getPath('exe')); // .../X.app/Contents/MacOS
+    let p = path.dirname(app.getPath('exe'));
     for (let i = 0; i < 3; i += 1) {
       if (p.endsWith('.app')) return p;
       p = path.dirname(p);
     }
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   return '';
 }
 
-/** staging 里找 .app（zip 顶层可能是 .app 或包一层目录）。 */
 function findAppBundle(dir) {
   const stack = [dir];
   while (stack.length) {
     const cur = stack.shift();
     let entries = [];
-    try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
+    try {
+      entries = fs.readdirSync(cur, { withFileTypes: true });
+    } catch {
+      continue;
+    }
     for (const e of entries) {
       if (!e.isDirectory()) continue;
       const full = path.join(cur, e.name);
@@ -207,15 +300,15 @@ function findAppBundle(dir) {
   return '';
 }
 
-function downloadFile(url, dest) {
+function downloadFile(url, dest, onPercent) {
   return new Promise((resolve, reject) => {
     const tmp = `${dest}.part`;
     const file = fs.createWriteStream(tmp);
-    const req = require('node:https').get(url, { headers: { 'User-Agent': USER_AGENT() } }, (res) => {
+    const req = require('node:https').get(url, { headers: { 'User-Agent': userAgent() } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         file.close();
         fs.rmSync(tmp, { force: true });
-        downloadFile(res.headers.location, dest).then(resolve, reject);
+        downloadFile(res.headers.location, dest, onPercent).then(resolve, reject);
         return;
       }
       if (res.statusCode !== 200) {
@@ -224,10 +317,27 @@ function downloadFile(url, dest) {
         reject(new Error(`HTTP ${res.statusCode}`));
         return;
       }
+      const total = Number(res.headers['content-length'] || 0);
+      let seen = 0;
+      res.on('data', (chunk) => {
+        seen += chunk.length;
+        if (total && onPercent) onPercent(Math.round((seen / total) * 100));
+      });
       res.pipe(file);
-      file.on('finish', () => file.close(() => { fs.renameSync(tmp, dest); resolve(); }));
+      file.on('finish', () => file.close(() => {
+        fs.renameSync(tmp, dest);
+        resolve();
+      }));
     });
-    req.on('error', (e) => { try { file.close(); fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } reject(e); });
+    req.on('error', (e) => {
+      try {
+        file.close();
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        /* ignore */
+      }
+      reject(e);
+    });
     req.setTimeout(600000, () => req.destroy(new Error('download timeout')));
   });
 }
@@ -240,15 +350,14 @@ function sha256File(p) {
 
 /**
  * 写替换脚本：等本进程退出 → 旧 .app 移进废纸篓 → 新 .app 就位 →
- * 清 quarantine → ad-hoc 重签 → open 重启。
- * 用 `open -a` 之外的 shell（nohup）保证脚本在主进程退出后仍存活。
+ * 清 quarantine → ad-hoc 重签 → open 重启。**只在用户点过「更新」后才会走到这里。**
  */
 function writeAndLaunchSwapScript(appPath, newApp, staging, latest) {
   const script = path.join(staging, 'swap.sh');
   const trashName = `${path.basename(appPath)}.old-${Date.now()}`;
   const trashDir = path.join(os.homedir(), '.Trash');
   const body = `#!/bin/bash
-# PH Launcher 自动更新替换脚本（生成的）
+# PH Launcher 自动更新替换脚本（用户已确认更新后生成）
 set -u
 TARGET="${appPath}"
 NEW="${newApp}"
@@ -285,32 +394,32 @@ rm -rf "$STAGING" 2>/dev/null || true
   fs.writeFileSync(script, body, { mode: 0o755 });
   const child = spawn('/bin/bash', [script], { detached: true, stdio: 'ignore' });
   child.unref();
-  notify('PH Launcher 正在更新', `退出后将自动替换为 v${latest}。`);
-  // 让主进程退出，把舞台交给替换脚本
-  setTimeout(() => { app.quit(); }, 1200);
 }
 
-/** 降级路径：自动替换准备失败时，至少把用户送到能拿到新版的地方。 */
-async function fallbackOpenDownloadPage(latest) {
-  notify('发现新版本 PH Launcher', `v${latest} 已发布，前往下载页更新。`);
-  try { await shell.openExternal(DOWNLOAD_URL); } catch { /* ignore */ }
-}
+// ---------------- 入口 ----------------
 
 /**
- * 应用启动时调用一次（由 main.cjs 在 app ready 后触发）。
- * Windows 全自动；macOS 半自动提示。启动后约 3 秒才检查，避免拖慢首屏。
+ * 应用启动后调用一次（main.cjs 在窗口创建后触发）。
+ * 只**检查并提示**；用户点「更新」之前不会有任何下载或安装动作。
  */
-function initAutoUpdater() {
+function initAutoUpdater(injected) {
+  if (injected) hooks = { ...hooks, ...injected };
+  if (skipAutoCheck) return;   // 自检/冒烟/截图模式不联网
   if (process.platform === 'win32') {
-    setTimeout(checkWindowsUpdate, 3000);
+    setTimeout(() => { checkWindows().catch(() => {}); }, 3000);
   } else if (process.platform === 'darwin') {
-    setTimeout(checkMacUpdate, 3000);
+    setTimeout(() => { checkMac().catch(() => {}); }, 3000);
   }
 }
 
-// 测试时（self-test / smoke-test）跳过自动更新，避免网络请求干扰
+// 测试时（self-test / smoke-test）跳过自动检查，避免网络请求干扰
 function disableAutoUpdater() {
   skipAutoCheck = true;
 }
 
-module.exports = { initAutoUpdater, disableAutoUpdater, getStatus: () => updaterStatus };
+module.exports = {
+  initAutoUpdater,
+  disableAutoUpdater,
+  handleUserChoice,
+  getStatus: () => phase,
+};

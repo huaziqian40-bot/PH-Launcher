@@ -247,6 +247,51 @@ function relativeTime(value) {
   return new Date(value).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
 }
 
+/* ---------------- 发现新版本：卡片（取消 / 跳过本版本 / 更新） ----------------
+ * 主进程只负责**检查与通知**；下不下载、装不装，永远由用户在这张卡片上决定。
+ * 「跳过本版本」记住的是版本号本身：之后更高的版本还会再提示。
+ */
+function showUpdateCard(info) {
+  const dialog = $('#updateDialog');
+  if (!dialog) return;
+  const latest = String(info?.version || '');
+  const current = String(info?.current || '');
+  $('#updateVersion').textContent = current
+    ? `新版本 v${latest}（当前 v${current}）`
+    : `新版本 v${latest}`;
+  const notes = String(info?.notes || '').trim();
+  $('#updateNotes').textContent = notes || '本次更新以稳定性与体验改进为主。';
+  $('#updateHint').textContent = '更新会下载新版本并在你确认后安装，不会丢失任何数据。';
+  $('#updateNow').disabled = false;
+  $('#updateSkip').disabled = false;
+  if (!dialog.open) dialog.showModal();
+}
+
+function handleUpdateProgress(progress) {
+  const dialog = $('#updateDialog');
+  const hint = $('#updateHint');
+  if (!hint) return;
+  const stage = String(progress?.stage || '');
+  if (stage === 'downloading') {
+    const pct = Number(progress?.percent);
+    hint.textContent = Number.isFinite(pct) && pct > 0
+      ? `正在下载新版本… ${Math.round(pct)}%`
+      : '正在下载新版本…';
+    $('#updateNow').disabled = true;
+    $('#updateSkip').disabled = true;
+  } else if (stage === 'applying') {
+    hint.textContent = progress?.message || '正在准备更新，应用即将重启…';
+  } else if (stage === 'error') {
+    hint.textContent = `更新失败：${progress?.message || '未知原因'}。可以稍后再试。`;
+    $('#updateNow').disabled = false;
+    $('#updateSkip').disabled = false;
+  } else if (stage === 'done') {
+    hint.textContent = progress?.message || '更新已就绪。';
+  }
+  if (dialog && !dialog.open && stage !== 'done') dialog.showModal();
+}
+
+
 function isToday(value) {
   return value && localDateKey(new Date(value)) === localDateKey();
 }
@@ -3420,6 +3465,22 @@ function bindEvents() {
   $('#aiEditConfig').addEventListener('click', beginAiEditing);
   $('#aiConfigPanel').addEventListener('click', handleAiConfigPanelClick);
 
+  // 更新卡片的三个按钮：取消（这次先不选）/ 跳过本版本 / 更新
+  $('#updateCancel')?.addEventListener('click', async () => {
+    $('#updateDialog')?.close();
+    await window.ph.updateChoice?.('cancel');
+  });
+  $('#updateSkip')?.addEventListener('click', async () => {
+    $('#updateDialog')?.close();
+    await window.ph.updateChoice?.('skip');
+    toast('已跳过这个版本；更高的新版本仍会提示', 'normal');
+  });
+  $('#updateNow')?.addEventListener('click', async () => {
+    $('#updateNow').disabled = true;
+    $('#updateSkip').disabled = true;
+    await window.ph.updateChoice?.('update');
+  });
+
   $('#studentNameSetting').addEventListener('input', (event) => { state.data.settings.studentName = event.target.value; updateClock(); persistData(); });
   $('#startupSyncSetting').addEventListener('change', (event) => { state.data.settings.schoolStartupSync = event.target.checked; persistData(true); });
   $('#openAtLoginSetting').addEventListener('change', (event) => { state.data.settings.openAtLogin = event.target.checked; persistData(true); });
@@ -3603,6 +3664,9 @@ async function init() {
         else setTimeout(() => openPhixOnboarding(), 300);
       });
     });
+    // 发现新版本：弹卡片让用户决定（取消 / 跳过本版本 / 更新）—— 绝不自动更新。
+    window.ph.onUpdateAvailable?.((info) => showUpdateCard(info));
+    window.ph.onUpdateProgress?.((progress) => handleUpdateProgress(progress));
     if (state.data.settings.onboardingCompleted !== true) {
       // 先尝试恢复 phix 会话（盘上有令牌就跳过 phix 引导）
       const restored = await tryPhixRestore();

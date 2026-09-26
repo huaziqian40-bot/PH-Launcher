@@ -353,6 +353,9 @@ function createDefaultData() {
       minimizeToTray: true,
       defaultReminderMinutes: 10,
       schoolStartupSync: true,
+      // 用户在更新卡片上点过「跳过本版本」的那个版本号：该版本不再提示，
+      // 但更高的新版本仍会照常弹卡片。
+      skippedUpdateVersion: '',
       ai: {
         enabled: false,
         provider: 'off',
@@ -4300,6 +4303,11 @@ function registerIpc() {
   ipcMain.handle('dictionary:lookup', (_event, query) => offlineDictionary.lookup(query));
   ipcMain.handle('ib:command-catalog', () => commandTermCatalog());
   ipcMain.handle('system:version', () => app.getVersion());
+  // 用户在更新卡片上的选择：'cancel'（这次先不选）/ 'skip'（跳过本版本）/ 'update'（开始更新）
+  ipcMain.handle('app:update-choice', (event, choice) => {
+    assertMainRenderer(event);
+    return autoUpdater.handleUserChoice(String(choice || ''));
+  });
   ipcMain.handle('system:splash-state', (event) => { assertMainRenderer(event); return splashState(); });
   ipcMain.handle('system:hardware', () => getHardwareProfile());
   ipcMain.handle('system:open-url', (_event, rawUrl) => {
@@ -5520,12 +5528,25 @@ app.whenReady().then(() => {
   startupMark('ipc-ready');
   createWindow();
   startupMark('window-created');
-  // 应用内自动更新：Windows 全自动（electron-updater），macOS 半自动（提示下载页）。
+  // 应用内更新：**只检查、只提示**（弹卡片让用户选取消/跳过本版本/更新），
+  // 用户点「更新」之前不会有任何下载或安装动作。
   // 自检/冒烟/截图模式不联网检查，避免干扰测试与自动化。
   if (IS_HEADLESS) {
     autoUpdater.disableAutoUpdater();
   } else {
-    autoUpdater.initAutoUpdater();
+    autoUpdater.initAutoUpdater({
+      getSkippedVersion: () => String(secureStore?.data?.settings?.skippedUpdateVersion || ''),
+      setSkippedVersion: (version) => {
+        try {
+          secureStore.data.settings.skippedUpdateVersion = String(version || '');
+          secureStore.save();
+        } catch (error) {
+          console.error('记录跳过的版本失败:', error.message);
+        }
+      },
+      sendToRenderer: (channel, payload) => sendToRenderer(channel, payload),
+      getMainWindow: () => mainWindow,
+    });
   }
   if (!IS_HEADLESS) {
     reminderWindows = createReminderWindowManager({ BrowserWindow, ipcMain, path, parentWindow: () => mainWindow,

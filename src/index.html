@@ -316,5 +316,13 @@
     <script src="./app.js"></script>
     <dialog class="modal onboarding-dialog" id="onboardingDialog"><form id="onboardingForm"><div class="modal-head"><div><span class="section-kicker">WELCOME</span><h3>欢迎使用 PH Launcher</h3></div><button type="button" id="onboardingClose" aria-label="关闭引导">×</button></div><div id="onboardingContent"></div><div class="modal-actions"><button class="ghost-button" type="button" id="onboardingSkip">跳过引导</button><div><button class="secondary-button" type="button" id="onboardingBack">上一步</button><button class="primary-button" type="button" id="onboardingNext">下一步</button></div></div></form></dialog>
     <dialog class="modal onboarding-dialog" id="phixOnboardingDialog"><form id="phixOnboardingForm"><div class="modal-head"><div><span class="section-kicker">PHIX</span><h3>phix 云同步账号</h3></div><button type="button" id="phixOnboardingClose" aria-label="关闭">×</button></div><div id="phixOnboardingContent"></div><div class="modal-actions"><button class="ghost-button" type="button" id="phixOnboardingSkip">跳过</button><div id="phixOnboardingActions"></div></div></form></dialog>
+    <!-- 发现新版本：只提示，由用户决定更不更新（绝不自动更新） -->
+    <dialog class="modal update-dialog" id="updateDialog"><div class="modal-head"><div><span class="section-kicker">UPDATE</span><h3>发现新版本</h3></div></div>
+      <div class="update-version" id="updateVersion"></div>
+      <div class="update-notes-label">本次更新内容</div>
+      <div class="update-notes" id="updateNotes"></div>
+      <div class="update-hint" id="updateHint">更新会下载新版本并在你确认后安装，不会丢失任何数据。</div>
+      <div class="modal-actions update-actions"><button class="ghost-button" type="button" id="updateCancel">取消</button><button class="text-button" type="button" id="updateSkip">跳过本版本</button><button class="primary-button" type="button" id="updateNow">更新</button></div>
+    </dialog>
   </body>
 </html>

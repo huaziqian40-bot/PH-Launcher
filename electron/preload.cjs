@@ -230,4 +230,10 @@ contextBridge.exposeInMainWorld('ph', {
   //: 命令行 `--ph-force-onboarding`：让首启引导再出现一次（只影响这一次运行）。
   onForceOnboarding: (callback) => on('app:force-onboarding', callback),
   onTrayNavigate: (callback) => on('tray:navigate', callback),
+  //: 发现新版本：主进程只**通知**，由界面弹卡片让用户选（绝不自动更新）。
+  onUpdateAvailable: (callback) => on('app:update-available', callback),
+  //: 用户在卡片上选完：'cancel'（这次先不选）/ 'skip'（跳过本版本）/ 'update'（开始更新）。
+  updateChoice: (choice) => ipcRenderer.invoke('app:update-choice', choice),
+  //: 更新进度（下载中/替换中/失败原因），供卡片显示状态。
+  onUpdateProgress: (callback) => on('app:update-progress', callback),
 });
